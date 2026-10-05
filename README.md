@@ -30,7 +30,7 @@ conda activate cworthy
 
 All Perlmutter paths (scratch, data, cases, codes) and NERSC account info live in
 `workflows/config.py`. To run this yourself, edit `account` and `dir_project_root` there. Several
-analysis scripts (`analysis.py`, and steps 05–13) also hard-code the NERSC paths where the
+analysis scripts (`analysis.py`, and steps 05–09) also hard-code the NERSC paths where the
 published atlas data were written. Search for `/global/cfs` to find them.
 
 ### CESM antitracer branch
@@ -104,24 +104,15 @@ Run these in order. Notebooks are run top-to-bottom in Jupyter; `.sh` scripts ar
 Dependency chain: `01 → 02 → 03 → 04 → 05 → 07`, with `06` running in parallel off separately
 archived "true" experiments rather than off step 4's output.
 
-## Diagnostics used in the paper (`workflows/08` – `13`)
+## Air-sea flux maps (`workflows/08` – `09`)
 
-These produce the spatial fields behind the paper's CESM figures (air-sea flux maps, surface δALK,
-pH). All are `sbatch`ed from inside `workflows/`. See [`PIPELINE.md`](workflows/PIPELINE.md) for
-inputs, outputs and directory layout of steps 10–13.
+These produce the time-integrated air-sea CO2 flux anomaly maps behind the paper's polygon flux
+figures (Fig. 12, S38–S40). Both are `sbatch`ed from inside `workflows/`.
 
-- **`08-integrate-flux-map.sh`** → `integrate_flux_map.py`. Time-integrated CDR tracer air-sea
-  CO2 flux anomaly maps for selected polygons (`<SUFFIX> <MODE> --polygons ...`).
+- **`08-integrate-flux-map.sh`** → `integrate_flux_map.py`. CDR tracer flux anomaly maps for
+  selected polygons (`<SUFFIX> <MODE> --polygons ...`), written as `flux_map_<polygon>.nc`.
 - **`09-integrate-true-flux-map.sh`** → `integrate_true_flux_map.py`. The same for the truth
-  experiments.
-- **`10-compute-truth-surface.sh`** → `compute_truth_surface.py`. Downloads truth surface fields
-  (ALK, ALK_ALT_CO2, PH, PH_ALT_CO2) for all 690 polygons from the public S3 archive.
-- **`11-compute-dalk-timeseries.sh`** → `compute_dalk_timeseries.py`. Surface δALK time series,
-  truth and CDR tracer. Needs step 10.
-- **`12-compute-ph.sh`** → `compute_ph.py`. CDR tracer surface pH fields (PyCO2SYS).
-  Independent of step 11.
-- **`13-compute-max-dph.sh`** → `compute_max_dph.py`. Per-cell maximum δpH. Needs steps 10
-  and 12.
+  experiments, written as `flux_map.nc` per truth experiment.
 
 The polygon lists and DOR/OAE mode are set by commenting/uncommenting lines in the `.sh` files.
 
