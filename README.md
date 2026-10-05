@@ -41,7 +41,7 @@ paper's atlas used commit `0c1fdae`. You don't need to clone it by hand: the fir
 `import config` (which `atlas.py`/`cesm.py` do), `workflows/config.py` clones that repo into
 `codes/cesm2.2.0` and checks out `anti-tracer` automatically if it isn't already there.
 
-## Running CDR tracer experiments (`workflows/01` – `07`)
+## Running CDR tracer experiments (`workflows/01` – `09`)
 
 Run these in order. Notebooks are run top-to-bottom in Jupyter; `.sh` scripts are submitted with
 `sbatch` from inside `workflows/`.
@@ -98,27 +98,28 @@ Run these in order. Notebooks are run top-to-bottom in Jupyter; `.sh` scripts ar
 7. **`07-validation-integral.ipynb`** — Loads the integrated curves from steps 5 and 6
    (`open_deficit_tracer_curve` / `open_true_curve` in `analysis.py`) and plots polygon maps,
    normalized uptake-efficiency curves, air-sea flux, and forcing, comparing the antitracer
-   approximation against the true simulation. Run last, once 5 and 6 have output for the
+   approximation against the true simulation. Run once 5 and 6 have output for the
    polygons/suffix you want to check.
 
+8. **`08-integrate-flux-map.sh`** — `sbatch 08-integrate-flux-map.sh`. Runs
+   `integrate_flux_map.py`, which time-integrates the CDR tracer air-sea CO2 flux anomaly into
+   maps for selected polygons (`flux_map_<polygon>.nc`). These are the maps behind the paper's
+   polygon flux figures (Fig. 12, S38–S40). Requires step 4's case output.
+
+9. **`09-integrate-true-flux-map.sh`** — `sbatch 09-integrate-true-flux-map.sh`. Runs
+   `integrate_true_flux_map.py`, the same for the truth experiments (`flux_map.nc` per truth
+   experiment).
+
+In steps 8 and 9, the polygon list and DOR/OAE mode are set by commenting/uncommenting lines in
+the `.sh` file.
+
 Dependency chain: `01 → 02 → 03 → 04 → 05 → 07`, with `06` running in parallel off separately
-archived "true" experiments rather than off step 4's output.
-
-## Air-sea flux maps (`workflows/08` – `09`)
-
-These produce the time-integrated air-sea CO2 flux anomaly maps behind the paper's polygon flux
-figures (Fig. 12, S38–S40). Both are `sbatch`ed from inside `workflows/`.
-
-- **`08-integrate-flux-map.sh`** → `integrate_flux_map.py`. CDR tracer flux anomaly maps for
-  selected polygons (`<SUFFIX> <MODE> --polygons ...`), written as `flux_map_<polygon>.nc`.
-- **`09-integrate-true-flux-map.sh`** → `integrate_true_flux_map.py`. The same for the truth
-  experiments, written as `flux_map.nc` per truth experiment.
-
-The polygon lists and DOR/OAE mode are set by commenting/uncommenting lines in the `.sh` files.
+archived "true" experiments rather than off step 4's output. `08` needs `04`; `09` runs off the
+archived truth experiments like `06`.
 
 ## Running your own experiment
 
-Steps 1–7 as shipped only cover the basins/polygons/dates already baked into the config. To force
+Steps 1–9 as shipped only cover the basins/polygons/dates already baked into the config. To force
 a new location, or a period outside what's already been computed, you need to do some of the
 following before/inside step 3:
 
@@ -190,13 +191,13 @@ following before/inside step 3:
   functions used by `integrate.py`, `integrate_true.py`, and notebook 07.
 - **`compute_sensitivities.py`** — Script invoked by `02-compute_sensitivities.sh`; also supports
   a `--config monthly` mode (reads control output from a public S3 bucket) that isn't currently
-  used by the 01–07 pipeline (which uses `--config daily`).
+  used by the 01–09 pipeline (which uses `--config daily`).
 - **`integrate.py`** — Script invoked by `05-integrate.sh`.
 - **`integrate_true.py`** — Script invoked by `06-integrate-true.sh`.
 - **`consolidate_forcing.py`** / **`submit_consolidate.sh`** — One-off utility
   (`sbatch submit_consolidate.sh`) that consolidates the individual per-basin/polygon
   `alk-forcing-*.nc` files into a single `deficit_tracer_forcing_1999-01.nc` with one variable per
-  polygon. Not part of the main 01–07 pipeline.
+  polygon. Not part of the main 01–09 pipeline.
 - **`interactive_job_perlmutter.sh`** — `salloc` one-liner for grabbing an interactive Perlmutter
   compute node (4 hr, `cpu` constraint, account `m4632`) to run notebooks/scripts outside batch.
 - **`carbonate_sensitivities.py`** — β/η computation with PyCO2SYS, used by
