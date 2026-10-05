@@ -1,0 +1,824 @@
+import os
+import shutil
+from glob import glob
+from subprocess import check_call
+from pathlib import Path
+from datetime import datetime
+
+import textwrap
+
+import numpy as np
+import pandas as pd
+
+import machine
+from config import project_sname, paths, account, machine_name
+
+scriptroot = paths["workflow"]
+os.makedirs(f"{scriptroot}/output/build-in", exist_ok=True)
+os.makedirs(f"{scriptroot}/output/build-out", exist_ok=True)
+
+PYTHON_MODULE = "python/3.11-24.1.0"
+cesm_inputdata = paths["cesm_inputdata_ro"]
+
+def create_smyle_clone(
+    case,
+    refdate="0347-01-01",
+    queue="regular",
+    #queue="debug",
+    cdr_forcing=None,
+    cdr_forcing_files=None,
+    cdr_forcing_varnames=None,
+    beta_file=None,
+    beta_varname="dDICdCO2",
+    beta_year_first=1998,
+    beta_year_last=2020,
+    beta_year_align=347,
+    beta_tintalgo="linear",
+    beta_taxMode="cycle",
+    eta_file=None,
+    eta_varname="dDICdALK",
+    eta_year_first=1998,
+    eta_year_last=2020,
+    eta_year_align=347,
+    eta_tintalgo="linear",
+    eta_taxMode="cycle",
+    antitracer_year_first=1999,
+    antitracer_year_last=2019,
+    antitracer_year_align=347,
+    antitracer_tintalgo="linear",
+    antitracer_taxMode="cycle",
+    antitracer_is_alk_list=None,
+    antitracer_coupled_alk_idx_list=None,
+    antitracer_master_indices=None,
+    clobber=False,
+    curtail_output=True,
+    stop_n=1, # antitracer
+    #stop_n=16, # control
+    stop_option="nyear",
+    wallclock="48:00:00",
+    resubmit=14, # antitracer
+    #resubmit=0,
+    #resubmit=0, # control
+):
+
+    caseroot = f"{paths['cases']}/{case}"
+    assert (
+        not os.path.exists(caseroot) or clobber
+    ), f"Case {case} exists; caseroot:\n{caseroot}\n"
+    
+    allowed_cdr_forcings = ["OAE", "DOR", "ERW", "ANTITRACER"]
+    if cdr_forcing is not None:
+        assert cdr_forcing in allowed_cdr_forcings, f"Unknown CDR forcing: {cdr_forcing}"
+    
+    # ----------------------------------------------------------------------
+    # Validate ANTITRACER requirements early (before building the case)
+    # ----------------------------------------------------------------------
+    if cdr_forcing == "ANTITRACER":
+    
+        # -- master indices must be provided
+        if not isinstance(antitracer_master_indices, list):
+            raise TypeError(
+                "For 'ANTITRACER', 'antitracer_master_indices' must be a list."
+            )
+
+        # Number of tracers defined by the configuration
+        n_tracers = len(antitracer_master_indices)
+    
+        # -- cdr_forcing_files must be a list
+        if not isinstance(cdr_forcing_files, list):
+            raise TypeError(
+                "For 'ANTITRACER', 'cdr_forcing_files' must be a list of file paths."
+            )
+
+        # --- Validate forcing file count -----------------------------------
+        if len(cdr_forcing_files) != n_tracers:
+            raise ValueError(
+                "Invalid ANTITRACER forcing configuration:\n"
+                f"- Provided forcing files: {len(cdr_forcing_files)}\n"
+                f"- Number of tracers:     {n_tracers}\n\n"
+                "Expected: One file per tracer.\n"
+            )
+
+        # -- cdr_forcing_varnames must be a list
+        if not isinstance(cdr_forcing_varnames, list):
+            raise TypeError(
+                "For 'ANTITRACER', 'cdr_forcing_varnames' must be a list of varnames."
+            )
+
+        # --- Validate varname count -----------------------------------
+        if len(cdr_forcing_varnames) != n_tracers:
+            raise ValueError(
+                "Invalid ANTITRACER forcing configuration:\n"
+                f"- Provided varnames: {len(cdr_forcing_varnames)}\n"
+                f"- Number of tracers:     {n_tracers}\n\n"
+                "Expected: One varname per tracer.\n"
+            )
+
+        # -- validate beta file
+        if beta_file is None:
+            raise ValueError(
+                "For 'ANTITRACER', 'beta_file' must be provided and cannot be None."
+            )
+
+        if not isinstance(beta_file, (str, Path)):
+            raise TypeError(
+                f"'beta_file' must be a string or Path, got {type(beta_file)}"
+            )
+
+        beta_path = Path(beta_file)
+        if not beta_path.exists():
+            raise FileNotFoundError(
+                f"'beta_file' does not exist: {beta_path}"
+            )
+
+        # -- validate eta file
+        if eta_file is None:
+            raise ValueError(
+                "For 'ANTITRACER', 'eta_file' must be provided and cannot be None."
+            )
+
+        if not isinstance(eta_file, (str, Path)):
+            raise TypeError(
+                f"'eta_file' must be a string or Path, got {type(eta_file)}"
+            )
+
+        eta_path = Path(eta_file)
+        if not eta_path.exists():
+            raise FileNotFoundError(
+                f"'eta_file' does not exist: {eta_path}"
+            )
+
+
+    rundir = f"{paths['scratch']}/{case}/run"
+    blddir = f"{paths['scratch']}/{case}/bld"
+    archive_root = f"{paths['data']}/archive/{case}"
+
+    check_call(["rm", "-fr", caseroot])
+    check_call(["rm", "-fr", archive_root])
+    check_call(["rm", "-fr", f"{paths['scratch']}/{case}"])
+
+    refcase = "g.e22.GOMIPECOIAF_JRA-1p4-2018.TL319_g17.SMYLE.005"
+    refcaserest_root = "/global/cfs/projectdirs/m4746/Datasets/SMYLE-FOSI/rest"
+    compset = (
+        "OMIP_DATM%JRA-1p4-2018_SLND_CICE_POP2%ECO_DROF%JRA-1p4-2018_SGLC_WW3_SIAC_SESP"
+    )
+    res = "TL319_g17"
+
+    check_call(
+        " ".join(
+            [
+                f"module load {PYTHON_MODULE}",
+                "&&",
+                "./create_newcase",
+                "--compset",
+                compset,
+                "--case",
+                caseroot,
+                "--res",
+                res,
+                "--machine",
+                machine_name,
+                "--compiler",
+                "intel",
+                "--project",
+                account,
+                "--queue",
+                queue,
+                "--walltime",
+                wallclock,
+                "--handle-preexisting-dirs",
+                "r",
+                "--run-unsupported",
+            ]
+        ),
+        shell=True,
+        cwd=f"{paths['src']}/cime/scripts",
+    )
+
+    def xmlchange(arg, force=False):
+        """call xmlchange"""
+        check_call(f"module load {PYTHON_MODULE} && ./xmlchange {arg}", cwd=caseroot, shell=True)
+
+    xmlchange("MAX_TASKS_PER_NODE=128")
+    xmlchange("MAX_MPITASKS_PER_NODE=128")
+
+    xmlchange("NTASKS_ATM=72")
+    xmlchange("NTASKS_CPL=72")
+    xmlchange("NTASKS_WAV=72")
+    xmlchange("NTASKS_GLC=72")
+    xmlchange("NTASKS_ICE=72")
+    xmlchange("NTASKS_ROF=72")
+    xmlchange("NTASKS_LND=72")
+    xmlchange("NTASKS_ESP=72")
+    xmlchange("NTASKS_IAC=72")
+
+    xmlchange("NTASKS_OCN=751")
+    xmlchange("ROOTPE_OCN=72")
+
+    xmlchange("CICE_BLCKX=16")
+    xmlchange("CICE_BLCKY=16")
+    xmlchange("CICE_MXBLCKS=7")
+    xmlchange("CICE_DECOMPTYPE='sectrobin'")
+    xmlchange("CICE_DECOMPSETTING='square-ice'")
+
+    if cdr_forcing == "ANTITRACER":
+        xmlchange(f"ANTITRACER_TRACER_CNT={n_tracers}")
+        xmlchange("OCN_TRACER_MODULES='antitracer'")
+    else:
+        xmlchange("OCN_TRACER_MODULES='iage ecosys'")
+        xmlchange("ANTITRACER_TRACER_CNT=0")
+
+    xmlchange("DATM_PRESAERO='clim_1850'")
+
+    xmlchange("POP_AUTO_DECOMP=FALSE")
+    xmlchange("POP_BLCKX=9")
+    xmlchange("POP_BLCKY=16")
+    xmlchange("POP_NX_BLOCKS=36")
+    xmlchange("POP_NY_BLOCKS=24")
+    xmlchange("POP_MXBLCKS=1")
+    xmlchange("POP_DECOMPTYPE='spacecurve'")
+
+    # Create SourceMods directory first
+    src_pop_dir = f"{caseroot}/SourceMods/src.pop"
+    if not os.path.exists(src_pop_dir):
+        os.makedirs(src_pop_dir)
+    
+    # Create an empty list to store all source files
+    all_source_files = []
+    
+    # Get all SourceMods from the reference case
+    all_source_files.extend(glob(f"{scriptroot}/input/cesm2.2.0/cases/{refcase}/SourceMods/src.pop/*"))
+    
+    # Add curtail_output files if requested
+    if curtail_output:
+        all_source_files.extend(glob(f"{scriptroot}/input/cesm2.2.0/SourceMods/curtail-output-gx1v7/src.pop/*"))
+    elif cdr_forcing != "ANTITRACER":
+        all_source_files.extend(glob(f"{scriptroot}/input/cesm2.2.0/SourceMods/gx1v7/src.pop/*"))    
+        
+    # Add antitracer specific files
+    if cdr_forcing == "ANTITRACER":
+        
+        # Filter out iage and ecosys files from the complete list
+        src_pop_files = [f for f in all_source_files if 'iage' not in f and 'ecosys' not in f]
+    
+    else: # For other forcings, use the unfiltered list
+        src_pop_files = all_source_files
+    
+    # Remove duplicates by converting to a set and back to a list
+    src_pop_files = list(set(src_pop_files))
+    
+    # copy SourceMod files
+    for src in src_pop_files:
+        src_basename = os.path.basename(src)
+        if src_basename == "diagnostics_latest.yaml":
+            check_call(
+                " ".join(
+                    [
+                        f"module load {PYTHON_MODULE}",
+                        "&&",
+                        f"{paths['src']}/components/pop/externals/MARBL/MARBL_tools/./yaml_to_json.py",
+                        "-y",
+                        f"{src}",
+                        "-o",
+                        f"{caseroot}/SourceMods/src.pop",
+                    ]
+                ),
+                shell=True,
+            )
+        else:
+            dst = f"{caseroot}/SourceMods/src.pop/{src_basename}"
+            shutil.copyfile(src, dst)
+            if ".csh" in src_basename:
+                check_call(["chmod", "+x", dst])
+
+    xmlchange(f"RUNDIR={rundir}")
+    xmlchange(f"CIME_OUTPUT_ROOT={paths['scratch']}")
+
+    xmlchange(f"DIN_LOC_ROOT={cesm_inputdata}")
+    xmlchange(f"DOUT_S_ROOT='{paths['data']}/archive/$CASE'")
+
+    xmlchange(f"RUN_TYPE=branch")
+    xmlchange(f"RUN_STARTDATE={refdate}")
+    xmlchange(f"RUN_REFCASE={refcase}")
+    xmlchange(f"RUN_REFDATE={refdate}")
+
+    xmlchange(f"STOP_N={stop_n}")
+    xmlchange(f"STOP_OPTION={stop_option}")
+    xmlchange(f"REST_N=1")
+    xmlchange(f"REST_OPTION={stop_option}")
+    xmlchange(f"RESUBMIT={resubmit}")
+    xmlchange(f"JOB_WALLCLOCK_TIME={wallclock}")
+
+    xmlchange(f"CHARGE_ACCOUNT={account}")
+    xmlchange(f"PROJECT={account}")
+    xmlchange(f"JOB_QUEUE={queue}")
+
+    # copy restarts
+    os.makedirs(rundir, exist_ok=True)
+    check_call(
+        f"cp {refcaserest_root}/{refdate}-00000/* {rundir}/.",
+        shell=True,
+    )
+
+    check_call(
+        f"module load {PYTHON_MODULE} && ./case.setup",
+        cwd=caseroot,
+        shell=True,
+    )
+
+    # copy RefCase user_nl files
+    user_nl_files = glob(f"{scriptroot}/input/cesm2.2.0/cases/{refcase}/user_nl*")
+    for file in user_nl_files:
+        file_out = os.path.join(caseroot, os.path.basename(file))
+        print(f"{file} -> {file_out}")
+        with open(file, "r") as fid:
+            file_str = fid.read().replace(
+                "/glade/p/cesmdata/cseg/inputdata", cesm_inputdata
+            )
+        with open(file_out, "w") as fid:
+            fid.write(file_str)
+
+    # user_datm files
+    user_datm_files = glob(f"{scriptroot}/input/cesm2.2.0/cases/{refcase}/user_datm.*")
+    for file in user_datm_files:
+        file_out = os.path.join(caseroot, os.path.basename(file))
+        print(f"{file} -> {file_out}")
+        with open(file, "r") as fid:
+            file_str = fid.read().replace(
+                "/glade/p/cesmdata/cseg/inputdata", cesm_inputdata
+            )
+        with open(file_out, "w") as fid:
+            fid.write(file_str)
+
+    # namelist
+    user_nl = dict()
+
+    # Initialize variables for other CDR forcings (if not "ANTITRACER")
+    lalk_forcing_apply_file_flux = ".false."
+    ldic_forcing_apply_file_flux = ".false."
+    alk_forcing_scale_factor = 1.0
+    dic_forcing_scale_factor = -1.0
+    atm_alt_co2_opt = "const"
+
+    antitracer_on = ".false."
+    _cdr_forcing_file = "dummy-file-path" # Use a temp variable here
+
+    if cdr_forcing is None:
+        pass # Defaults are already set above
+
+    elif cdr_forcing == "OAE":
+        lalk_forcing_apply_file_flux = ".true."
+        atm_alt_co2_opt = "drv_diag"
+        _cdr_forcing_file = cdr_forcing_files[0] if cdr_forcing_files else "dummy-file-path"
+
+    elif cdr_forcing == "DOR":
+        ldic_forcing_apply_file_flux = ".true."
+        atm_alt_co2_opt = "drv_diag"
+        _cdr_forcing_file = cdr_forcing_files[0] if cdr_forcing_files else "dummy-file-path"
+
+    elif cdr_forcing == "ERW":
+        lalk_forcing_apply_file_flux = ".true."
+        ldic_forcing_apply_file_flux = ".true."
+        atm_alt_co2_opt = "drv_diag"
+        _cdr_forcing_file = cdr_forcing_files[0] if cdr_forcing_files else "dummy-file-path"
+
+
+    if cdr_forcing != "ANTITRACER":
+        user_nl["marbl"] = textwrap.dedent(
+            f"""\
+            lalk_forcing_apply_flux = {lalk_forcing_apply_file_flux}
+            ldic_forcing_apply_flux = {ldic_forcing_apply_file_flux}
+            alk_forcing_scale_factor = {alk_forcing_scale_factor}
+            dic_forcing_scale_factor = {dic_forcing_scale_factor}
+            """
+        )
+
+        user_nl["pop"] = textwrap.dedent(
+            f"""\
+            antitracer_on = {antitracer_on}
+            atm_alt_co2_opt = '{atm_alt_co2_opt}'
+            lecosys_tavg_alt_co2 = .true.
+            alk_forcing_shr_stream_year_first = 1999
+            alk_forcing_shr_stream_year_last = 2019
+            alk_forcing_shr_stream_year_align = 347
+            alk_forcing_shr_stream_file = '{_cdr_forcing_file}'
+            alk_forcing_shr_stream_scale_factor = 1.0e5 ! convert from mol/m^2/s to nmol/cm^2/s
+            """
+        )
+
+    else:
+        user_nl["pop"] = ""
+
+
+    if curtail_output:
+        user_nl["pop"] += textwrap.dedent(
+            f"""\
+        ! curtail output
+        ldiag_bsf = .false.    
+        diag_gm_bolus = .false.
+        moc_requested = .false.
+        n_heat_trans_requested = .false.
+        n_salt_trans_requested = .false.
+        ldiag_global_tracer_budgets = .false.
+        """
+        )
+    else:
+        user_nl["pop"] += textwrap.dedent(
+            f"""\
+        n_tavg_streams = 2
+
+        tavg_freq_opt           = 'nmonth', 'nday'
+        tavg_freq               = 1, 1
+        tavg_file_freq_opt      = 'nmonth', 'nmonth'
+        tavg_file_freq          = 1, 1
+        tavg_start_opt          = 'nstep', 'nstep'
+        tavg_start              = 0, 0
+        tavg_fmt_in             = 'nc', 'nc'
+        tavg_fmt_out            = 'nc', 'nc'
+        tavg_stream_filestrings = 'nmonth1', 'nday1'
+
+        ldiag_bsf = .false.    
+        diag_gm_bolus = .false.
+        moc_requested = .false.
+        n_heat_trans_requested = .false.
+        n_salt_trans_requested = .false.
+        ldiag_global_tracer_budgets = .false.
+        """
+        )
+        
+    if cdr_forcing == "ANTITRACER":
+        antitracer_on = ".true."
+
+        # Generate antitracer-specific namelist entries for user_nl_pop
+        antitracer_nl_entries = []
+        antitracer_nl_entries.append("  init_antitracer_option = 'zero'")
+        antitracer_nl_entries.append("  init_antitracer_init_file = 'same_as_TS'")
+
+        # --- Generate namelist entries ---
+        for i, (fpath, varname, master_idx) in enumerate(zip(cdr_forcing_files, cdr_forcing_varnames, antitracer_master_indices)):
+            idx = i + 1  # Fortran 1-based index
+
+            padded_master_idx = f"{master_idx:03d}"
+
+            is_alk = antitracer_is_alk_list[i] if antitracer_is_alk_list is not None else False
+            tracer_prefix = "DELTAALK" if is_alk else "DELTADIC"
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%name = '{tracer_prefix}{padded_master_idx}'")
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%file = '{fpath}'")
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%varname = '{varname}'")
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%year_first = {antitracer_year_first}")
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%year_last = {antitracer_year_last}")
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%year_align = {antitracer_year_align}")
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%scale_factor = 1.0e5")
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%tintalgo = '{antitracer_tintalgo}'")
+            antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%taxMode = '{antitracer_taxMode}'")
+
+            if antitracer_is_alk_list is not None:
+                is_alk_str = ".true." if antitracer_is_alk_list[i] else ".false."
+                antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%is_alk_only = {is_alk_str}")
+
+            if antitracer_coupled_alk_idx_list is not None:
+                coupled_idx = antitracer_coupled_alk_idx_list[i]
+                if coupled_idx > 0:
+                    antitracer_nl_entries.append(f"  antitracer_forcing_nml_array({idx})%coupled_alk_idx = {coupled_idx}")
+
+
+        antitracer_nl_str = "\n".join(antitracer_nl_entries)
+        
+        beta_nl_str = textwrap.dedent(f"""
+          beta_forcing_nml%file = '{str(beta_file)}'
+          beta_forcing_nml%varname = '{str(beta_varname)}'
+          beta_forcing_nml%year_first = {beta_year_first}
+          beta_forcing_nml%year_last = {beta_year_last}
+          beta_forcing_nml%year_align = {beta_year_align}
+          beta_forcing_nml%tintalgo = '{beta_tintalgo}'
+          beta_forcing_nml%taxMode = '{beta_taxMode}'
+        """)
+
+        eta_nl_str = textwrap.dedent(f"""
+          eta_forcing_nml%file = '{str(eta_file)}'
+          eta_forcing_nml%varname = '{str(eta_varname)}'
+          eta_forcing_nml%year_first = {eta_year_first}
+          eta_forcing_nml%year_last = {eta_year_last}
+          eta_forcing_nml%year_align = {eta_year_align}
+          eta_forcing_nml%tintalgo = '{eta_tintalgo}'
+          eta_forcing_nml%taxMode = '{eta_taxMode}'
+        """)
+
+        pop_nl_content = textwrap.dedent(f"""\
+        &sw_absorption_nml
+          chl_option = 'file'
+        /
+        &passive_tracers_on_nml
+          antitracer_on = .true.
+        /
+        &antitracer_nml
+        {antitracer_nl_str}
+        {beta_nl_str}
+        {eta_nl_str}
+        /""")
+
+        user_nl["pop"] = user_nl["pop"] + "\n" + pop_nl_content.strip()
+
+        # Write per-type index files used by ocn.antitracer.tavg.csh
+        is_alk = antitracer_is_alk_list or [False] * n_tracers
+        dic_indices = [midx for midx, alk in zip(antitracer_master_indices, is_alk) if not alk]
+        alk_indices = [midx for midx, alk in zip(antitracer_master_indices, is_alk) if alk]
+
+        for fname, indices in [
+            ("antitracer_indices_dic.txt", dic_indices),
+            ("antitracer_indices_alk.txt", alk_indices),
+        ]:
+            fpath = f"{caseroot}/{fname}"
+            print(f"INFO: Writing antitracer indices to {fpath}")
+            with open(fpath, "w") as f:
+                f.write(" ".join(map(str, indices)))
+
+    for key, nl in user_nl.items():
+        user_nl_file = f"{caseroot}/user_nl_{key}"
+        with open(user_nl_file, "a") as fid:
+            fid.write(user_nl[key])
+
+    # set ALT_CO2 tracers to CO2 tracers
+    if cdr_forcing is not None:
+        check_call(
+            ["./set-alt-co2.sh", f"{rundir}/{refcase}.pop.r.{refdate}-00000.nc"],
+            cwd=scriptroot,
+        )
+
+    print(caseroot)
+    check_call(
+        f"module load {PYTHON_MODULE} && ./case.build --skip-provenance-check",
+        cwd=caseroot,
+        shell=True,
+    )
+
+    return
+
+
+def create_hr_4p2z_clone(
+    case,
+    refdate="0347-01-01",
+    queue="regular",
+    cdr_forcing=None,
+    cdr_forcing_file=None,
+    clobber=False,
+    curtail_output=True,
+    stop_n=15,
+    stop_option="nyear",
+    wallclock="48:00:00",
+    resubmit=0,
+):
+    caseroot = f"{paths['cases']}/{case}"
+    assert (
+        not os.path.exists(caseroot) or clobber
+    ), f"Case {case} exists; caseroot:\n{caseroot}\n"
+
+    if cdr_forcing is not None:
+        assert cdr_forcing in ["OAE", "DOR"], f"Unknown CDR forcing: {cdr_forcing}"
+
+    rundir = f"{paths['scratch']}/{case}/run"
+    blddir = f"{paths['scratch']}/{case}/bld"
+    archive_root = f"{paths['data']}/archive/{case}"
+
+    check_call(["rm", "-fr", caseroot])
+    check_call(["rm", "-fr", archive_root])
+    check_call(["rm", "-fr", f"{paths['scratch']}/{case}"])
+
+    refcase = "g.e22.TL319_t13.G1850ECOIAF_JRA_HR.4p2z.001"
+    refcaserest_root = "/global/cfs/projectdirs/m4746/Datasets/HR_4p2z/rest"
+    compset = "G1850ECOIAF_JRA_HR"
+    res = "TL319_t13"
+
+    check_call(
+        " ".join(
+            [
+                f"module load {PYTHON_MODULE}",
+                "&&",
+                "./create_newcase",
+                "--compset",
+                compset,
+                "--case",
+                caseroot,
+                "--res",
+                res,
+                "--machine",
+                machine_name,
+                "--compiler",
+                "intel",
+                "--project",
+                account,
+                "--queue",
+                queue,
+                "--walltime",
+                wallclock,
+                "--handle-preexisting-dirs",
+                "r",
+                "--run-unsupported",
+            ]
+        ),
+        shell=True,
+        cwd=f"{paths['src']}/cime/scripts",
+    )
+
+    def xmlchange(arg, opt="", force=False):
+        """call xmlchange"""
+        check_call(
+            f"module load {PYTHON_MODULE} && ./xmlchange {opt} {arg}", cwd=caseroot, shell=True
+        )
+
+    xmlchange(f"RUNDIR={rundir}")
+    xmlchange(f"CIME_OUTPUT_ROOT={paths['scratch']}")
+
+    xmlchange(f"DIN_LOC_ROOT={cesm_inputdata}")
+    xmlchange(f"DOUT_S_ROOT='{paths['data']}/archive/$CASE'")
+
+    xmlchange(f"OCN_CHL_TYPE=prognostic")
+    xmlchange(f"OCN_CO2_TYPE=diagnostic")
+    xmlchange(f"CCSM_BGC=CO2A")
+
+    xmlchange(f"RUN_TYPE=hybrid")
+    xmlchange(f"RUN_REFCASE={refcase}")
+    xmlchange(f"RUN_REFDATE={refdate}")
+    xmlchange(f"RUN_STARTDATE={refdate}")
+
+    xmlchange(f"OCN_TRACER_MODULES=ecosys")
+
+    xmlchange(f"CICE_CONFIG_OPTS='-trage 0'", opt="-a")
+
+    xmlchange(f"DATM_MODE=CORE_IAF_JRA")
+    xmlchange(f"DROF_MODE=IAF_JRA")
+    xmlchange(f"DATM_CO2_TSERIES=omip")
+    xmlchange(f"CPL_SEQ_OPTION=RASM_OPTION1")
+
+    xmlchange(f"NTASKS_OCN=25654")
+
+    xmlchange(f"STOP_N={stop_n}")
+    xmlchange(f"STOP_OPTION={stop_option}")
+    xmlchange(f"REST_N={stop_n}")
+    xmlchange(f"REST_OPTION={stop_option}")
+    xmlchange(f"RESUBMIT={resubmit}")
+    xmlchange(f"JOB_WALLCLOCK_TIME={wallclock}", opt="--subgroup case.run")
+
+    xmlchange(f"CHARGE_ACCOUNT={account}")
+    xmlchange(f"PROJECT={account}")
+    xmlchange(f"JOB_QUEUE={queue}")
+
+    check_call(
+        f"module load {PYTHON_MODULE} && ./case.setup",
+        cwd=caseroot,
+        shell=True,
+    )
+
+    # refcase SourceMods
+    # check_call(
+    #    f"cp -vr {scriptroot}/input/cesm2.2.0/cases/{refcase}/SourceMods/* {caseroot}/SourceMods",
+    #    shell=True,
+    # )
+
+    ## TODO: add CDR source mods
+
+    # list user_nl files
+    user_nl_files = glob(f"{scriptroot}/input/cesm2.2.0/cases/{refcase}/user_nl*")
+    for file in user_nl_files:
+        file_out = os.path.join(caseroot, os.path.basename(file))
+        print(f"{file} -> {file_out}")
+        with open(file, "r") as fid:
+            file_str = fid.read().replace(
+                "/glade/p/cesmdata/cseg/inputdata", cesm_inputdata
+            )
+        with open(file_out, "w") as fid:
+            fid.write(file_str)
+
+    # user_datm files
+    user_datm_files = glob(f"{scriptroot}/input/cesm2.2.0/cases/{refcase}/user_datm.*")
+    for file in user_datm_files:
+        file_out = os.path.join(caseroot, os.path.basename(file))
+        print(f"{file} -> {file_out}")
+        with open(file, "r") as fid:
+            file_str = fid.read().replace(
+                "/work/02503/edwardsj/CESM/inputdata", cesm_inputdata
+            )
+        with open(file_out, "w") as fid:
+            fid.write(file_str)
+
+    # namelist
+    user_nl = dict()
+
+    tavg_contents_override_file = f"{scriptroot}/input/cesm2.2.0/cases/{refcase}/tavg_contents/tx0.1v3_tavg_contents_no5day_4p2z"
+    n_tavg_streams = 3
+
+    user_nl["pop"] = textwrap.dedent(
+        f"""\
+        ! tavg contents
+        tavg_contents_override_file = '{tavg_contents_override_file}'
+        n_tavg_streams = {n_tavg_streams}
+        
+        ! ndep from shr_stream
+        ndep_data_type = 'shr_stream'
+        ndep_shr_stream_file = '{cesm_inputdata}/ocn/pop/tx0.1v3/forcing/ocn_Ndep_transient_forcing_x0.1_241004.nc'
+        ndep_shr_stream_scale_factor = 7.1429e+06
+        ndep_shr_stream_year_align = 1958
+        ndep_shr_stream_year_first = 1958
+        ndep_shr_stream_year_last = 2021
+        """
+    )
+
+    for key, nl in user_nl.items():
+        user_nl_file = f"{caseroot}/user_nl_{key}"
+        with open(user_nl_file, "a") as fid:
+            fid.write(user_nl[key])
+
+    # copy restarts
+    check_call(
+        f"cp -v {refcaserest_root}/{refdate}-00000/* {rundir}/.",
+        shell=True,
+    )
+
+    check_call(
+        f"module load {PYTHON_MODULE} && ./case.build --skip-provenance-check",
+        cwd=caseroot,
+        shell=True,
+    )
+
+
+def case_status(vintage=None, caselist=None, path_cases=None):
+    """look at all CaseStatus files and extract information"""
+
+    if path_cases is None:
+        path_cases = paths["cases"]
+
+    caseroots = sorted(glob(f"{path_cases}/*"))
+
+    if vintage is not None:
+        n = len(vintage) + 1
+        caseroots = [c for c in caseroots if c[-n:] == f".{vintage}"]
+
+    if caselist is not None:
+        caseroots = [c for c in caseroots if os.path.basename(c) in caselist]
+
+    rows = []
+    df_caseinfo = None
+
+    # get the queue status
+    job_info = machine.queue_info()
+
+    for caseroot in caseroots:
+        case = os.path.basename(caseroot)
+        CaseStatus = f"{caseroot}/CaseStatus"
+        timing_files = sorted(glob(f"{caseroot}/timing/cesm_timing.{case}.*"))
+
+        lines = []
+        if os.path.exists(CaseStatus):
+            with open(CaseStatus, "r") as fid:
+                lines = fid.readlines()
+
+        timestamp_run = None
+        for l in lines:
+            if "case.run success" in l:
+                datetime_str = l[:19]
+                timestamp_run = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
+
+        row_data = dict(
+            case=case,
+            build=any("case.build success" in line for line in lines),
+            submitted=any("case.submit success" in line for line in lines),
+            run_completed=any("case.run success" in line for line in lines),
+            archive=any("st_archive success" in line for line in lines),
+            error=any("ERROR" in line for line in lines),
+            error_count=sum(["ERROR" in line for line in lines]),
+            timestamp_run=timestamp_run,
+            JobId=None,
+            JobState=None,
+            Queued=False,
+        )
+
+        if case in job_info:
+            row_data["Queued"] = True
+            row_data["JobId"] = job_info[case]["JobId"]
+            row_data["JobState"] = job_info[case]["JobState"]
+
+        yrs_per_day = np.nan
+        cost = np.nan
+        if timing_files:
+            for f in timing_files:
+                with open(f, "r") as fid:
+                    lines = fid.readlines()
+
+            yrs_per_day = np.array(
+                [np.float64(l.split()[2]) for l in lines if "Model Throughput:" in l]
+            )
+            yrs_per_day = yrs_per_day.mean()
+
+            cost = np.array(
+                [np.float64(l.split()[2]) for l in lines if "Model Cost:" in l]
+            )
+            cost = cost.mean()
+
+        row_data["yr_per_day"] = yrs_per_day
+        row_data["pe-hr_per_yr"] = cost
+        rows.append(row_data)
+
+    if rows:
+        df_caseinfo = pd.DataFrame(rows).set_index("case")
+
+    return df_caseinfo
